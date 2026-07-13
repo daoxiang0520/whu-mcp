@@ -1,15 +1,29 @@
 """
-武大图书馆 MCP Server — Streamable HTTP 模式
+武大图书馆 MCP Server — 支持 stdio 和 SSE 两种传输模式
 
-部署后 Claude Code 通过 HTTP 远程调用，凭证存在 Redis 中。
-Streamlit 负责登录写入 Redis，MCP Server 负责读取 Redis 并执行 API 调用。
+stdio 模式 (本地, 零依赖):
+    python server.py --transport stdio
+    Claude Code 配置:
+    {
+      "mcpServers": {
+        "whu-lib": {
+          "command": "python",
+          "args": ["-X", "utf8", "/path/to/server.py", "--transport", "stdio"]
+        }
+      }
+    }
 
-启动:
-    python server.py
-    # 或指定端口: python server.py --port 8000
-
-依赖:
-    pip install mcp redis requests urllib3 pycryptodomex playwright
+SSE 模式 (远程服务器):
+    python server.py --transport sse --port 8000
+    Claude Code 配置:
+    {
+      "mcpServers": {
+        "whu-lib": {
+          "type": "sse",
+          "url": "https://your-server/sse"
+        }
+      }
+    }
 """
 
 import sys
@@ -27,14 +41,56 @@ import uvicorn
 
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
-from mcp.types import Tool, TextContent
+from mcp.types import Tool, TextContent, ImageContent
 
 from redis_store import CredStore
 
 # ── 配置 ────────────────────────────────────────────────────
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
-cred_store = CredStore(redis_url=REDIS_URL)
+class FileStore:
+    """本地文件凭证存储 (stdio 模式使用，零外部依赖)。"""
+    def __init__(self):
+        self._path = os.path.join(os.path.dirname(__file__), ".whu_session.json")
+
+    def save(self, castgc: str, token: str, hmac_key: str,
+             student_id: str = "", educational: str = "", **kw) -> str:
+        data = {"castgc": castgc, "library_token": token,
+                "library_hmac_key": hmac_key, "student_id": student_id,
+                "educational": educational}
+        import json as _json
+        with open(self._path, "w", encoding="utf-8") as f:
+            _json.dump(data, f, ensure_ascii=False)
+        return "local"
+
+    def get(self, session_id: str = "") -> dict | None:
+        import json as _json
+        try:
+            with open(self._path, "r", encoding="utf-8") as f:
+                return _json.load(f)
+        except Exception:
+            return None
+
+    def delete(self, session_id: str = "") -> bool:
+        try:
+            os.remove(self._path)
+            return True
+        except Exception:
+            return False
+
+    def exists(self, session_id: str = "") -> bool:
+        return os.path.exists(self._path)
+
+
+cred_store = None  # 在 main 中根据 --transport 初始化
+
+
+def _get_store():
+    """获取凭证存储实例 (延迟初始化)。"""
+    assert cred_store is not None, "cred_store 未初始化"
+    return cred_store
+
+
 server = Server("whu-lib")
 
 # ══════════════════════════════════════════════════════════════
@@ -55,7 +111,7 @@ def _do_login(sid: str, pwd: str) -> tuple:
 
 def _do_get_session(session_id: str) -> tuple:
     """同步：从 Redis 取凭证 → 创建 LibrarySession → 返回 (session, error)"""
-    creds = cred_store.get(session_id)
+    creds = _get_store().get(session_id)
     if not creds:
         return None, "❌ session 无效或已过期，请重新登录。"
     try:
@@ -163,7 +219,7 @@ def _do_stop(session_id: str) -> str:
 
 def _get_educational(session_id: str) -> tuple[str | None, str | None]:
     """从 Redis 获取 educational (教务系统) cookie。"""
-    creds = cred_store.get(session_id)
+    creds = _get_store().get(session_id)
     if not creds:
         return None, "❌ session 无效或已过期。"
     edu = creds.get("educational", "")
@@ -292,6 +348,39 @@ def _do_query_grades(session_id: str, year: str, semester: str) -> str:
     return format_grade_report(items, year, semester_display)
 
 
+# QR 登录的全局状态（同一时刻只有一个 QR 码有效）
+_qr_client = None
+
+
+def _do_get_qr() -> str:
+    """同步：获取 CAS QR 码，返回 base64 PNG。"""
+    global _qr_client
+    from cas_login import CasClient
+    _qr_client = CasClient()
+    qr_b64 = _qr_client.qr_get_image()
+    if not qr_b64:
+        raise RuntimeError("获取 CAS QR 码失败，请重试。")
+    return qr_b64
+
+
+def _do_poll_qr(session_id: str) -> tuple[str, str, str, str]:
+    """同步：轮询 QR 扫码结果 → harvest → 返回 (castgc, token, hmac_key, educational)"""
+    global _qr_client
+    from login_helper import harvest_from_castgc
+    if _qr_client is None:
+        from cas_login import CasClient
+        _qr_client = CasClient()
+        _qr_client.qr_get_image()  # 获取新 QR
+    castgc = _qr_client.qr_poll(timeout=120)
+    if not castgc:
+        raise TimeoutError("QR 码扫码超时 (120s)，请重新调用 login_qr 重试。")
+    qr_client = _qr_client
+    _qr_client = None
+    harvest = harvest_from_castgc(castgc)
+    return (castgc, harvest["library_token"], harvest["library_hmac_key"],
+            harvest.get("educational", ""))
+
+
 def _do_weather() -> str:
     """同步：查询武大天气，复用 weather_tool.py。"""
     from weather_tool import get_whu_rain_forecast
@@ -320,6 +409,22 @@ async def list_tools() -> list[Tool]:
                     },
                 },
                 "required": ["student_id", "password"],
+            },
+        ),
+        Tool(
+            name="login_qr",
+            description="生成武大 CAS 扫码登录的二维码。QR 码直接在对话中显示，用户用智慧珞珈 APP 扫码。扫码后需调用 login_qr_poll 完成登录。",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        Tool(
+            name="login_qr_poll",
+            description="轮询 CAS 扫码状态。需先调用 login_qr 获取 QR 码。扫码完成后自动 harvest 凭证，返回 session_id。",
+            inputSchema={
+                "type": "object",
+                "properties": {},
             },
         ),
         Tool(
@@ -476,7 +581,7 @@ async def list_tools() -> list[Tool]:
 
 def _get_library_session(session_id: str):
     """从 Redis 获取凭证，创建 LibrarySession。"""
-    creds = cred_store.get(session_id)
+    creds = _get_store().get(session_id)
     if not creds:
         return None, "❌ session 无效或已过期，请重新登录。"
     try:
@@ -508,8 +613,42 @@ def _get_username_from_session(creds: dict) -> str:
 # ══════════════════════════════════════════════════════════════
 
 @server.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+async def call_tool(name: str, arguments: dict) -> list[TextContent | ImageContent]:
     match name:
+        case "login_qr":
+            try:
+                qr_b64 = await asyncio.to_thread(_do_get_qr)
+                return [
+                    ImageContent(type="image", data=qr_b64, mimeType="image/png"),
+                    TextContent(
+                        type="text",
+                        text=("📱 请用**智慧珞珈 APP** 扫描上方二维码\n"
+                              "扫码完成后，调用 `login_qr_poll` 完成登录。")
+                    ),
+                ]
+            except Exception as e:
+                return [TextContent(type="text", text=f"❌ 获取 QR 码失败: {e}")]
+
+        case "login_qr_poll":
+            try:
+                castgc, token, hmac_key, educational = await asyncio.to_thread(
+                    _do_poll_qr, ""
+                )
+                session_id = _get_store().save(
+                    castgc=castgc, token=token, hmac_key=hmac_key,
+                    educational=educational,
+                )
+                return [TextContent(
+                    type="text",
+                    text=(f"✅ 扫码登录成功！\n"
+                          f"session_id: `{session_id}`\n"
+                          f"有效期: 约 4 小时")
+                )]
+            except TimeoutError as e:
+                return [TextContent(type="text", text=f"⏰ {e}")]
+            except Exception as e:
+                return [TextContent(type="text", text=f"❌ 登录失败: {e}")]
+
         case "login_password":
             sid = arguments["student_id"]
             pwd = arguments["password"]
@@ -517,7 +656,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 castgc, token, hmac_key, educational = await asyncio.to_thread(
                     _do_login, sid, pwd
                 )
-                session_id = cred_store.save(
+                session_id = _get_store().save(
                     castgc=castgc, token=token, hmac_key=hmac_key,
                     student_id=sid, educational=educational,
                 )
@@ -684,13 +823,31 @@ async def async_app(scope, receive, send):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="WHU Library MCP Server")
-    parser.add_argument("--host", default="0.0.0.0", help="监听地址")
-    parser.add_argument("--port", type=int, default=8000, help="监听端口")
+    parser.add_argument("--transport", choices=["stdio", "sse"], default="sse",
+                        help="传输模式: stdio (本地) 或 sse (远程服务器)")
+    parser.add_argument("--host", default="0.0.0.0", help="SSE 模式监听地址")
+    parser.add_argument("--port", type=int, default=8000, help="SSE 模式监听端口")
     args = parser.parse_args()
 
-    print(f"""
+    if args.transport == "stdio":
+        # === stdio 模式：本地文件存储，零外部依赖 ===
+        from mcp.server.stdio import stdio_server as _stdio_server
+        _store = FileStore()
+        cred_store = _store
+        print(f"[stdio] 凭证文件: {_store._path}", file=sys.stderr)
+
+        async def _stdio_main():
+            async with _stdio_server() as (read, write):
+                await server.run(read, write, server.create_initialization_options())
+
+        asyncio.run(_stdio_main())
+
+    else:
+        # === SSE 模式：Redis 凭证 + HTTP 服务器 ===
+        cred_store = CredStore(redis_url=REDIS_URL)
+        print(f"""
 ==========================================================
-       WHU Library MCP Server (HTTP)
+       WHU Library MCP Server (SSE)
 
   SSE endpoint: http://{args.host}:{args.port}/sse
   Message endpoint: http://{args.host}:{args.port}/messages
@@ -707,6 +864,5 @@ if __name__ == "__main__":
     }}
   }}
 ==========================================================
-    """)
-
-    uvicorn.run(async_app, host=args.host, port=args.port)
+        """)
+        uvicorn.run(async_app, host=args.host, port=args.port)

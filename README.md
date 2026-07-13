@@ -1,160 +1,223 @@
 # WHU MCP Server
 
-武汉大学校园服务 MCP 服务器，提供图书馆座位、课表、成绩、考试、天气等 12 个工具，通过 SSE 协议供 Claude Code 远程调用。
+武汉大学校园服务 MCP 服务器 + Claude Code Skill，覆盖图书馆座位、课表、成绩、考试、天气五大场景。
 
-## 架构
+## 两种使用方式
 
-```
-用户浏览器                  Claude Code (你的电脑)       武大服务器
-─────────                 ──────────────────         ────────
-                                 │
-Streamlit :8501           SSE over HTTPS             CAS / 教务 / 图书馆
-    │                         │                         ▲
-    │  登录收割凭证              │  调用工具                 │
-    │                         │                         │
-    ▼                         ▼                         │
-┌──────────────────────────────────────────────┐       │
-│                  Redis                       │       │
-│          whu:session:<session_id>            │       │
-│     {castgc, token, hmac_key, educational}   │       │
-│              TTL: 4 小时                      │       │
-└──────────────────────────────────────────────┘       │
-                         │                              │
-                     MCP Server :8000 ──────────────────┘
-                    (本目录, lib/ 自包含)
-```
+| | 远程 SSE（推荐） | 本地 stdio |
+|---|---|---|
+| **需要什么** | 我们维护的服务器 | 自己电脑跑 |
+| **配置** | 三行 JSON | 三行 JSON |
+| **安装** | 零安装 | pip install |
+| **多人共享** | ✅ 同一服务器 | ❌ 各自独立 |
+| **依赖 Redis** | ✅ 凭证中心存储 | ❌ 本地文件 |
 
-## 快速开始
+## 用户指南
 
-### 前置条件
+### 方式一：远程 SSE
 
-- Python 3.10+
-- Redis (宝塔面板→软件商店→安装)
-- Playwright 浏览器
-
-### 安装
-
-```bash
-cd mcp_http
-pip install -r requirements.txt
-playwright install chromium
-playwright install-deps chromium
-```
-
-### 配置
-
-```bash
-# 复制环境变量模板
-cp .env.example .env
-
-# 如果 Redis 有密码，修改 .env:
-# REDIS_URL=redis://:你的密码@localhost:6379
-```
-
-### 启动
-
-```bash
-python server.py --host 127.0.0.1 --port 8000
-```
-
-
-### 配置 Claude Code
-
-`~/.mcp.json`:
+**1.** 在 `~/.mcp.json` 中加入：
 
 ```json
 {
   "mcpServers": {
     "whu-lib": {
       "type": "sse",
-      "url": "https://你的域名或IP/sse"
+      "url": "https://whu-mcp.daoxiang.xyz/sse"
     }
   }
 }
 ```
 
-重启 Claude Code 生效。
+**2.** 安装 Skill（可选但推荐）：
 
-## 工具列表
+```bash
+mkdir -p ~/.claude/skills/whu-lib
+cp skill/SKILL.md ~/.claude/skills/whu-lib/SKILL.md
+```
+
+**3.** 重启 Claude Code。
+
+### 方式二：本地 stdio
+
+**1.** 安装：
+
+```bash
+git clone https://github.com/daoxiang0520/LuojiaAgent.git
+cd LuojiaAgent/mcp_http
+pip install -r requirements.txt
+playwright install chromium
+```
+
+**2.** `~/.mcp.json`：
+
+```json
+{
+  "mcpServers": {
+    "whu-lib": {
+      "command": "python",
+      "args": ["-X", "utf8", "/绝对路径/mcp_http/server.py", "--transport", "stdio"]
+    }
+  }
+}
+```
+
+**3.** 重启 Claude Code。
+
+### 三种登录方式
+
+| 方式 | 工具 | 说明 |
+|---|---|---|
+| 密码登录 | `login_password` | 在对话中直接输入学号密码 |
+| 扫码登录 | `login_qr` → `login_qr_poll` | QR 码在对话中显示，APP 扫码 |
+| Streamlit | 浏览器 | 扫码后侧边栏获取 session_id |
+
+### 日常使用
+
+```
+第一次:
+
+  你: "帮我登录武大"
+  Claude: [显示 QR 码]
+  [你用 APP 扫码]
+  Claude: "✅ session_id: abc123"
+
+之后（4 小时内无需重新登录）:
+
+  你: "工学分馆明天下午有座位吗"
+  你: "我这学期 GPA 多少"
+  你: "明天什么课"
+  你: "帮我预约 305 区 120 号"
+  你: "我要走了，签退"
+  你: "明天要带伞吗"
+```
+
+## 工具列表（14 个）
 
 | 工具 | 需要登录 | 说明 |
 |---|---|---|
-| `login_password` | — | 学号+密码登录 CAS，获取所有凭证 |
+| `login_password` | — | 学号+密码登录 |
+| `login_qr` | — | 生成 CAS 扫码二维码 |
+| `login_qr_poll` | — | 轮询扫码结果，完成登录 |
 | `get_seats` | ✅ | 查询分馆座位大盘 |
 | `get_seat_map` | ✅ | 查询区域内座位排布 |
-| `reserve_seat` | ✅ | 预约座位 (自动破解验证码) |
+| `reserve_seat` | ✅ | 预约座位（自动破解验证码） |
 | `get_current_usage` | ✅ | 当前在坐座位 |
-| `get_reservations` | ✅ | 预约记录 (含历史) |
+| `get_reservations` | ✅ | 预约记录（含历史） |
 | `cancel_reservation` | ✅ | 取消预约 |
 | `stop_usage` | ✅ | 签退释放座位 |
 | `query_schedule` | ✅ | 课表查询 |
 | `query_exam_schedule` | ✅ | 考试安排 |
-| `query_grades` | ✅ | 成绩查询 (含 GPA) |
-| `get_weather` | ❌ | 珞珈山天气 (免登) |
+| `query_grades` | ✅ | 成绩查询（含 GPA） |
+| `get_weather` | ❌ | 珞珈山天气（免登） |
 
-## 使用流程
-
-### 方式一：Streamlit 登录
-
-1. 浏览器打开 Streamlit → 扫码/密码登录
-2. 侧边栏复制 `session_id`
-3. Claude Code 中：`session_id 是 xxx，帮我查总馆座位`
-
-### 方式二：Claude Code 直接登录
-
-在 Claude Code 中说：
+## 架构
 
 ```
-用学号 2025302114221 密码 xxxxxx 登录武大，然后查工学分馆今天下午的座位
+┌──────────────────────────────────────────────────────────┐
+│                      你的电脑                             │
+│  Claude Code                                             │
+│   ├── Skill (whu-lib)  ← 武大领域知识                    │
+│   └── MCP Client       ← SSE/stdio 协议                  │
+└──────────┬───────────────────────────────────────────────┘
+           │
+    ┌──────▼──────┐
+    │  MCP Server  │  也可远程部署 (whu-mcp.daoxiang.xyz)
+    │  :8000       │
+    └──────┬──────┘
+           │
+    ┌──────▼──────┐     ┌─────────────┐
+    │    Redis    │     │  lib/ 模块   │
+    │  session    │     │ library_api  │──▶ 图书馆 API
+    │  凭证 4h TTL │     │ courses_tool │──▶ 教务 API
+    └─────────────┘     │ weather_tool │──▶ 天气 API
+                        │ captcha      │──▶ 验证码破解
+                        └─────────────┘
 ```
 
-Claude 会自动调用 `login_password` → 拿到 session_id → 查询座位。
+## 部署（维护者）
+
+### 服务器
+
+```bash
+cd /www/wwwroot/luojiaagent/mcp_http
+pip install -r requirements.txt
+playwright install chromium && playwright install-deps chromium
+python server.py --transport sse --host 127.0.0.1 --port 8000
+```
+
+### 宝塔保活
+
+Supervisor → 添加守护进程：
+
+| 字段 | 值 |
+|---|---|
+| 名称 | whu-mcp |
+| 目录 | /www/wwwroot/luojiaagent/mcp_http |
+| 命令 | `python server.py --transport sse --host 127.0.0.1 --port 8000` |
+
+### Nginx 反代
+
+```nginx
+location /sse {
+    proxy_pass http://127.0.0.1:8000/sse;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_buffering off;
+    proxy_read_timeout 3600s;
+}
+location /messages { proxy_pass http://127.0.0.1:8000/messages; }
+location /health   { proxy_pass http://127.0.0.1:8000/health; }
+```
+
+### Streamlit 集成
+
+在 `app.py` 登录成功后：
+
+```python
+from streamlit_redis import save_to_redis
+sid = save_to_redis(
+    castgc=st.session_state.cookies["castgc"],
+    token=st.session_state.cookies["library_token"],
+    hmac_key=st.session_state.cookies["library_hmac_key"],
+    educational=st.session_state.cookies.get("educational", ""),
+    student_id=st.session_state.cookies.get("student_id", ""),
+)
+st.sidebar.success(f"MCP session_id: `{sid}`")
+```
 
 ## 项目结构
 
 ```
 mcp_http/
-├── server.py              # MCP Server 入口 (12 个工具)
-├── redis_store.py         # Redis 凭证存取层
+├── server.py              # MCP Server (--transport stdio|sse)
+├── redis_store.py         # Redis 凭证存取
 ├── streamlit_redis.py     # Streamlit ↔ Redis 集成
-├── test_mcp.py            # 本地 MCP 客户端测试
-├── requirements.txt       # Python 依赖
+├── requirements.txt
 ├── start.bat              # Windows 一键启动
-├── .env.example           # 环境变量模板
-└── lib/                   # 自包含依赖 (无需外部文件)
+├── README.md
+├── skill/
+│   └── SKILL.md           # Claude Code Skill
+└── lib/                   # 自包含依赖
     ├── library_api.py     # 图书馆 HMAC 签名 + API
-    ├── cas_login.py       # CAS 多种登录方式
-    ├── cas_encrypt.py     # 密码 AES-CBC 加密
+    ├── cas_login.py       # CAS 多方式登录
+    ├── cas_encrypt.py     # 密码 AES 加密
     ├── login_helper.py    # Playwright 凭证收割
-    ├── captcha_solver.py  # TAC 滑块验证码破解
-    ├── captcha_refs.npz   # 验证码模式参考库
-    ├── courses_tool.py    # 课表查询
-    ├── exam_tool.py       # 考试安排
-    ├── grades_tool.py     # 成绩查询
-    └── weather_tool.py    # 珞珈山天气
+    ├── captcha_solver.py  # 验证码破解
+    ├── captcha_refs.npz   # 参考库 (865KB)
+    ├── courses_tool.py    # 课表
+    ├── exam_tool.py       # 考试
+    ├── grades_tool.py     # 成绩
+    └── weather_tool.py    # 天气
 ```
 
-## 本地测试
+## FAQ
 
-```bash
-python test_mcp.py
-```
+**Q: 密码安全吗？**  
+A: HTTPS 传输，不存盘、不进日志、不进 Redis。对话中短暂出现后即被后续上下文覆盖。
 
-## 技术要点
+**Q: 为什么有时 404？**  
+A: Nginx 超时杀了 SSE 长连接。确认 `proxy_read_timeout 3600s` 已配置。
 
-- **ASGI 原生实现** — 无框架依赖，直接使用 `uvicorn` + ASGI 协议
-- **`asyncio.to_thread`** — 所有阻塞操作 (Playwright, requests) 运行在线程池，不阻塞事件循环
-- **Redis TTL 自动过期** — 凭证 4 小时自动清理，无需维护脚本
-- **三层 fallback** — 缓存优先 → 过期 harvest → 提示重新登录
-- **HMAC-SHA256 签名** — 纯 Python 复现图书馆 API 签名，~0.5s 响应
-- **TAC 验证码自动破解** — 模式参考图差分法，成功率 100%
-
-## 部署清单
-
-- [ ] Python 依赖安装完成
-- [ ] Playwright 浏览器安装完成
-- [ ] Redis 正在运行
-- [ ] Supervisor 保活已配置
-- [ ] 反向代理已配置 (可选)
-- [ ] Claude Code `~/.mcp.json` 已更新
-- [ ] Claude Code 已重启
+**Q: stdio 和 SSE 怎么选？**  
+A: 自己用 → stdio。给同学用 → SSE。
