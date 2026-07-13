@@ -29,8 +29,8 @@ Streamlit :8501           SSE over HTTPS             CAS / 教务 / 图书馆
 ### 前置条件
 
 - Python 3.10+
-- Redis (宝塔面板→软件商店→安装)
-- Playwright 浏览器
+- Redis
+- Playwright
 
 ### 安装
 
