@@ -90,7 +90,7 @@ python server.py --host 127.0.0.1 --port 8000
 | `query_schedule` | ✅ | 课表查询 |
 | `query_exam_schedule` | ✅ | 考试安排 |
 | `query_grades` | ✅ | 成绩查询 (含 GPA) |
-| `get_weather` | ❌ | 珞珈山天气 (免登) |
+| `get_weather` | ✅ | 珞珈山天气 (免登) |
 
 ## 使用流程
 
