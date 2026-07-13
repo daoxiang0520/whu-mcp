@@ -373,14 +373,14 @@ def _do_get_qr() -> str:
     if not data:
         raise RuntimeError("QR 解码失败，请重试。")
 
-    # 用相同数据生成 ASCII 终端二维码
+    # 用相同数据生成紧凑 ASCII 终端二维码
     import qrcode as _qr
-    qr = _qr.QRCode(border=2)
+    qr = _qr.QRCode(border=1, box_size=1)
     qr.add_data(data)
     qr.make()
     buf = _io.StringIO()
-    qr.print_ascii(out=buf)
-    return buf.getvalue()
+    qr.print_ascii(out=buf, invert=True)
+    return "\n" + buf.getvalue()
 
 
 def _do_poll_qr(session_id: str) -> tuple[str, str, str, str]:
@@ -640,9 +640,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent | ImageConte
                 qr_text = await asyncio.to_thread(_do_get_qr)
                 return [TextContent(
                     type="text",
-                    text=(f"{qr_text}\n"
-                          f"📱 请用**智慧珞珈 APP** 扫描上方二维码\n"
-                          f"扫码完成后，调用 `login_qr_poll` 完成登录。")
+                    text=(
+                        f"{qr_text}\n"
+                        f"📱 用智慧珞珈 APP 扫码，完成后告诉我"
+                    )
                 )]
             except Exception as e:
                 return [TextContent(type="text", text=f"❌ 获取 QR 码失败: {e}")]
