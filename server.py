@@ -357,7 +357,7 @@ def _do_get_qr() -> str:
     global _qr_client
     import base64 as _b64, io as _io
 
-    import numpy as _np
+    import cv2, numpy as _np
 
     from cas_login import CasClient
     _qr_client = CasClient()
