@@ -1,0 +1,712 @@
+"""
+武大图书馆 MCP Server — Streamable HTTP 模式
+
+部署后 Claude Code 通过 HTTP 远程调用，凭证存在 Redis 中。
+Streamlit 负责登录写入 Redis，MCP Server 负责读取 Redis 并执行 API 调用。
+
+启动:
+    python server.py
+    # 或指定端口: python server.py --port 8000
+
+依赖:
+    pip install mcp redis requests urllib3 pycryptodomex playwright
+"""
+
+import sys
+import os
+
+# 所有依赖模块统一放在 lib/ 目录，自包含
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "lib"))
+
+import json
+import asyncio
+import argparse
+from functools import partial
+
+import uvicorn
+
+from mcp.server import Server
+from mcp.server.sse import SseServerTransport
+from mcp.types import Tool, TextContent
+
+from redis_store import CredStore
+
+# ── 配置 ────────────────────────────────────────────────────
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+
+cred_store = CredStore(redis_url=REDIS_URL)
+server = Server("whu-lib")
+
+# ══════════════════════════════════════════════════════════════
+# 阻塞操作的同步实现（与 LuojiaAgent 一致，运行在 asyncio.to_thread）
+# ══════════════════════════════════════════════════════════════
+
+def _do_login(sid: str, pwd: str) -> tuple:
+    """同步：CAS 密码登录 → Playwright harvest → 返回 (castgc, token, hmac_key, educational)"""
+    from cas_login import CasClient
+    from login_helper import harvest_from_castgc
+
+    client = CasClient()
+    castgc = client.login_password(sid, pwd)
+    harvest = harvest_from_castgc(castgc)
+    return (castgc, harvest["library_token"], harvest["library_hmac_key"],
+            harvest.get("educational", ""))
+
+
+def _do_get_session(session_id: str) -> tuple:
+    """同步：从 Redis 取凭证 → 创建 LibrarySession → 返回 (session, error)"""
+    creds = cred_store.get(session_id)
+    if not creds:
+        return None, "❌ session 无效或已过期，请重新登录。"
+    try:
+        from library_api import LibrarySession
+        sess = LibrarySession(
+            token=creds["library_token"],
+            hmac_key_encrypted=creds["library_hmac_key"],
+        )
+        return (sess, creds), None
+    except Exception as e:
+        return None, f"❌ 创建 LibrarySession 失败: {e}"
+
+
+def _do_get_seats(session_id: str, date: str, library: str) -> str:
+    sess_creds, err = _do_get_session(session_id)
+    if err:
+        return err
+    sess, _creds = sess_creds
+    result = sess.get_seats(date, library)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+def _do_get_seat_map(session_id: str, date: str, area_id: str, begin_minute: int) -> str:
+    sess_creds, err = _do_get_session(session_id)
+    if err:
+        return err
+    sess, _creds = sess_creds
+    result = sess.get_seat_map(date, area_id, begin_minute)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+def _do_reserve(session_id: str, date: str, area_id: str,
+                seat_label: str, begin_minute: int, end_minute: int) -> str:
+    sess_creds, err = _do_get_session(session_id)
+    if err:
+        return err
+    sess, creds = sess_creds
+
+    # 1. 获取座位 UUID
+    seat_map = sess.get_seat_map(date, area_id)
+    seat_uuid = ""
+    for uid, info in seat_map.get("data", {}).items():
+        if info.get("label") == seat_label:
+            seat_uuid = uid
+            break
+    if not seat_uuid:
+        return f"❌ 未找到 {seat_label} 号座位。"
+
+    # 2. 提交预约
+    path = f"/jsq/static/frontApi/make/freeBook/{seat_uuid}/{date}/{begin_minute}/{end_minute}"
+    result = sess._post(path, {})
+    msg = result.get("message", "")
+
+    # 3. 触发验证码 → 自动破解 → 带 token 重试
+    if not result.get("status") and ("验证" in msg or "滑块" in msg or "captcha" in msg.lower()):
+        from captcha_solver import solve_captcha
+        username = creds.get("student_id", "")
+        cap_result = solve_captcha(username=username)
+        if cap_result.get("success"):
+            cap_token = cap_result.get("data", {}).get("token", "")
+            result = sess._post(f"{path}?capToken={cap_token}", {})
+
+    if result.get("status"):
+        return f"✅ 预约成功！{date} {seat_label}号"
+    return f"❌ 预约失败: {result.get('message', '未知错误')}"
+
+
+def _do_current_usage(session_id: str) -> str:
+    sess_creds, err = _do_get_session(session_id)
+    if err:
+        return err
+    sess, _creds = sess_creds
+    return json.dumps(sess.get_current_usage(), ensure_ascii=False, indent=2)
+
+
+def _do_reservations(session_id: str) -> str:
+    sess_creds, err = _do_get_session(session_id)
+    if err:
+        return err
+    sess, _creds = sess_creds
+    return json.dumps(sess.get_reservations(), ensure_ascii=False, indent=2)
+
+
+def _do_cancel(session_id: str, reservation_id: str) -> str:
+    sess_creds, err = _do_get_session(session_id)
+    if err:
+        return err
+    sess, _creds = sess_creds
+    result = sess.cancel(reservation_id)
+    if result.get("status"):
+        return "✅ 取消成功！"
+    return f"❌ 取消失败: {result.get('message', '未知错误')}"
+
+
+def _do_stop(session_id: str) -> str:
+    sess_creds, err = _do_get_session(session_id)
+    if err:
+        return err
+    sess, _creds = sess_creds
+    result = sess.stop()
+    if result.get("status"):
+        return "✅ 签退成功，座位已释放！"
+    return f"❌ 签退失败: {result.get('message', '未知错误')}"
+
+
+def _get_educational(session_id: str) -> tuple[str | None, str | None]:
+    """从 Redis 获取 educational (教务系统) cookie。"""
+    creds = cred_store.get(session_id)
+    if not creds:
+        return None, "❌ session 无效或已过期。"
+    edu = creds.get("educational", "")
+    if not edu or "JSESSIONID" not in edu:
+        return None, "❌ 教务系统 Cookie 缺失，请重新登录（login_password）获取完整凭证。"
+    return edu, None
+
+
+def _do_query_schedule(session_id: str, year: str, semester: str) -> str:
+    """同步：查询课表。复用 courses_tool.py 的逻辑。"""
+    from courses_tool import map_semester, format_schedule_report
+    import requests, time as _time, json as _json
+
+    edu_cookie, err = _get_educational(session_id)
+    if err:
+        return err
+
+    xqm_code, semester_display, start_sunday = map_semester(semester)
+
+    url = "https://jwgl.whu.edu.cn/kbcx/xskbcx_cxXsgrkb.html?gnmkdm=N2151"
+    headers = {
+        "Cookie": edu_cookie,
+        "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+        "Referer": "https://jwgl.whu.edu.cn/kbcx/xskbcx_cxXskbcxIndex.html?gnmkdm=N2151&layout=default",
+        "X-Requested-With": "XMLHttpRequest",
+        "User-Agent": "Mozilla/5.0",
+    }
+    payload = {
+        "xnm": year, "xqm": xqm_code, "kzlx": "ck",
+        "xsdm": "", "kclbdm": "", "kclxdm": "",
+        "validate": "fake_captcha_token_for_test:",
+    }
+
+    resp = requests.post(url, data=payload, headers=headers, timeout=15, verify=False)
+    if resp.status_code != 200:
+        return f"❌ 教务系统返回 HTTP {resp.status_code}"
+    data = _json.loads(resp.text)
+    kb_list = data.get("kbList", [])
+    if not kb_list:
+        # 自动回退到第二学期
+        if semester == "3":
+            xqm2, sem2_disp, start_sun2 = map_semester("2")
+            payload["xqm"] = xqm2
+            resp2 = requests.post(url, data=payload, headers=headers, timeout=15, verify=False)
+            data2 = _json.loads(resp2.text)
+            kb_list = data2.get("kbList", [])
+            semester_display = sem2_disp
+            start_sunday = start_sun2
+        if not kb_list:
+            return f"📭 {year}-{int(year)+1} 学年 {semester_display} 无课程安排。"
+    return format_schedule_report(kb_list, year, semester_display, start_sunday)
+
+
+def _do_query_exam(session_id: str, year: str, semester: str) -> str:
+    """同步：查询考试安排。"""
+    from exam_tool import map_semester, format_exam_report
+    import requests, time as _time, json as _json
+
+    edu_cookie, err = _get_educational(session_id)
+    if err:
+        return err
+
+    xqm_code, semester_display = map_semester(semester)
+
+    url = "https://jwgl.whu.edu.cn/kwgl/kscx_cxXsksxxIndex.html?doType=query&gnmkdm=N358105"
+    headers = {
+        "Cookie": edu_cookie,
+        "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+        "Referer": "https://jwgl.whu.edu.cn/kwgl/kscx_cxXsksxxIndex.html?gnmkdm=N358105&layout=default",
+        "X-Requested-With": "XMLHttpRequest",
+        "User-Agent": "Mozilla/5.0",
+    }
+    payload = {
+        "xnm": year, "xqm": xqm_code,
+        "ksmcdmb_id": "", "kch": "", "kc": "", "ksrq": "", "kkbm_id": "",
+        "_search": "false", "nd": str(int(_time.time() * 1000)),
+        "queryModel.showCount": "15", "queryModel.currentPage": "1",
+        "queryModel.sortName": "", "queryModel.sortOrder": "asc", "time": "3",
+    }
+
+    resp = requests.post(url, data=payload, headers=headers, timeout=15, verify=False)
+    if resp.status_code != 200:
+        return f"❌ 教务系统返回 HTTP {resp.status_code}"
+    data = _json.loads(resp.text)
+    items = data.get("items", [])
+    if not items:
+        return f"📭 {year}-{int(year)+1} 学年 {semester_display} 无考试安排。"
+    return format_exam_report(items, year, semester_display)
+
+
+def _do_query_grades(session_id: str, year: str, semester: str) -> str:
+    """同步：查询成绩。"""
+    from grades_tool import map_semester, format_grade_report
+    import requests, time as _time, json as _json
+
+    edu_cookie, err = _get_educational(session_id)
+    if err:
+        return err
+
+    xqm_code, semester_display = map_semester(semester)
+
+    url = "https://jwgl.whu.edu.cn/cjcx/cjcx_cxXsgrcj.html?doType=query&gnmkdm=N305005"
+    headers = {
+        "Cookie": edu_cookie,
+        "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+        "Referer": "https://jwgl.whu.edu.cn/cjcx/cjcx_cxDgXscj.html?gnmkdm=N305005&layout=default",
+        "X-Requested-With": "XMLHttpRequest",
+        "User-Agent": "Mozilla/5.0",
+    }
+    payload = {
+        "xnm": year, "xqm": xqm_code, "sfzgcj": "",
+        "validate": "sl4fz4ckumrbtqq6j:",
+        "kcbj": "", "pkey": "", "_search": "false",
+        "nd": str(int(_time.time() * 1000)),
+        "queryModel.showCount": "15", "queryModel.currentPage": "1",
+        "queryModel.sortName": "", "queryModel.sortOrder": "asc", "time": "666",
+    }
+
+    resp = requests.post(url, data=payload, headers=headers, timeout=15, verify=False)
+    if resp.status_code != 200:
+        return f"❌ 教务系统返回 HTTP {resp.status_code}"
+    data = _json.loads(resp.text)
+    items = data.get("items", [])
+    if not items:
+        return f"📭 {year}-{int(year)+1} 学年 {semester_display} 无成绩记录。"
+    return format_grade_report(items, year, semester_display)
+
+
+def _do_weather() -> str:
+    """同步：查询武大天气，复用 weather_tool.py。"""
+    from weather_tool import get_whu_rain_forecast
+    return get_whu_rain_forecast.invoke({})
+
+# ══════════════════════════════════════════════════════════════
+# 工具注册
+# ══════════════════════════════════════════════════════════════
+
+@server.list_tools()
+async def list_tools() -> list[Tool]:
+    return [
+        Tool(
+            name="login_password",
+            description="用学号和密码直接登录 CAS，获取图书馆凭证。凭证存入 Redis，返回 session_id。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "student_id": {
+                        "type": "string",
+                        "description": "学号（如 2025302114221）",
+                    },
+                    "password": {
+                        "type": "string",
+                        "description": "CAS 统一身份认证密码",
+                    },
+                },
+                "required": ["student_id", "password"],
+            },
+        ),
+        Tool(
+            name="get_seats",
+            description="查询图书馆某天的座位大盘。需要 session_id（从 login_password 获取，或从 Streamlit 登录后获取）。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "会话 ID（登录后获得）",
+                    },
+                    "date": {
+                        "type": "string",
+                        "description": "日期 YYYY-MM-DD",
+                    },
+                    "library": {
+                        "type": "string",
+                        "description": "分馆: 总馆/信息分馆/工学分馆/医学分馆",
+                        "default": "总馆",
+                    },
+                },
+                "required": ["session_id", "date"],
+            },
+        ),
+        Tool(
+            name="get_seat_map",
+            description="查询指定区域内所有座位的实时空闲状态。需要先通过 get_seats 获取 area_id。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string", "description": "会话 ID"},
+                    "date": {"type": "string", "description": "日期 YYYY-MM-DD"},
+                    "area_id": {"type": "string", "description": "区域 ID（19位雪花ID，从 get_seats 返回）"},
+                    "begin_time": {"type": "string", "description": "开始时间 HH:MM", "default": "08:12"},
+                },
+                "required": ["session_id", "date", "area_id"],
+            },
+        ),
+        Tool(
+            name="reserve_seat",
+            description="预约图书馆座位。自动破解滑块验证码。需要 session_id。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string", "description": "会话 ID"},
+                    "date": {"type": "string", "description": "日期 YYYY-MM-DD"},
+                    "area_id": {"type": "string", "description": "区域 ID"},
+                    "seat_label": {"type": "string", "description": "座位号（桌贴号）"},
+                    "begin_time": {"type": "string", "description": "开始时间 HH:MM"},
+                    "end_time": {"type": "string", "description": "结束时间 HH:MM"},
+                },
+                "required": ["session_id", "date", "area_id", "seat_label", "begin_time", "end_time"],
+            },
+        ),
+        Tool(
+            name="get_current_usage",
+            description="查询当前正在使用的座位（已签到入座）。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string", "description": "会话 ID"},
+                },
+                "required": ["session_id"],
+            },
+        ),
+        Tool(
+            name="get_reservations",
+            description="查询预约记录（含当前和历史）。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string", "description": "会话 ID"},
+                },
+                "required": ["session_id"],
+            },
+        ),
+        Tool(
+            name="cancel_reservation",
+            description="取消预约。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string", "description": "会话 ID"},
+                    "reservation_id": {"type": "string", "description": "预约单 ID"},
+                },
+                "required": ["session_id", "reservation_id"],
+            },
+        ),
+        Tool(
+            name="stop_usage",
+            description="签退释放当前座位。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string", "description": "会话 ID"},
+                },
+                "required": ["session_id"],
+            },
+        ),
+        Tool(
+            name="query_schedule",
+            description="查询武大教务系统课程表。需要 session_id（登录后获得）。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string", "description": "会话 ID"},
+                    "year": {"type": "string", "description": "学年，如 2025 表示 2025-2026", "default": "2025"},
+                    "semester": {"type": "string", "description": "学期: 1=第一学期, 2=第二学期, 3=第三学期", "default": "3"},
+                },
+                "required": ["session_id"],
+            },
+        ),
+        Tool(
+            name="query_exam_schedule",
+            description="查询武大教务系统期末考试安排。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string", "description": "会话 ID"},
+                    "year": {"type": "string", "description": "学年", "default": "2025"},
+                    "semester": {"type": "string", "description": "学期: 1/2/3", "default": "1"},
+                },
+                "required": ["session_id"],
+            },
+        ),
+        Tool(
+            name="query_grades",
+            description="查询武大教务系统成绩（含 GPA 计算）。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string", "description": "会话 ID"},
+                    "year": {"type": "string", "description": "学年", "default": "2025"},
+                    "semester": {"type": "string", "description": "学期: 1/2/3", "default": "2"},
+                },
+                "required": ["session_id"],
+            },
+        ),
+        Tool(
+            name="get_weather",
+            description="查询武汉大学（珞珈山）精准天气和降雨预测。无需登录。",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+    ]
+
+
+# ══════════════════════════════════════════════════════════════
+# 内部辅助
+# ══════════════════════════════════════════════════════════════
+
+def _get_library_session(session_id: str):
+    """从 Redis 获取凭证，创建 LibrarySession。"""
+    creds = cred_store.get(session_id)
+    if not creds:
+        return None, "❌ session 无效或已过期，请重新登录。"
+    try:
+        from library_api import LibrarySession
+        sess = LibrarySession(
+            token=creds["library_token"],
+            hmac_key_encrypted=creds["library_hmac_key"],
+        )
+        return sess, None
+    except Exception as e:
+        return None, f"❌ 创建 LibrarySession 失败: {e}"
+
+
+def _get_username_from_session(creds: dict) -> str:
+    """从 Redis 凭证中获取 username（用于验证码）。"""
+    sid = creds.get("student_id", "")
+    if not sid:
+        # 从 library_token 反推（JWT sub 字段）
+        try:
+            import base64 as _b64
+            jwt_token = ""  # 需要从 harvest 流程获取
+        except Exception:
+            pass
+    return sid
+
+
+# ══════════════════════════════════════════════════════════════
+# 工具实现
+# ══════════════════════════════════════════════════════════════
+
+@server.call_tool()
+async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    match name:
+        case "login_password":
+            sid = arguments["student_id"]
+            pwd = arguments["password"]
+            try:
+                castgc, token, hmac_key, educational = await asyncio.to_thread(
+                    _do_login, sid, pwd
+                )
+                session_id = cred_store.save(
+                    castgc=castgc, token=token, hmac_key=hmac_key,
+                    student_id=sid, educational=educational,
+                )
+                return [TextContent(
+                    type="text",
+                    text=(f"✅ 登录成功！\n"
+                          f"session_id: `{session_id}`\n"
+                          f"有效期: 约 4 小时")
+                )]
+            except Exception as e:
+                return [TextContent(type="text", text=f"❌ 登录失败: {e}")]
+
+        case "get_seats":
+            sid = arguments["session_id"]
+            date = arguments["date"]
+            library = arguments.get("library", "总馆")
+            result = await asyncio.to_thread(
+                _do_get_seats, sid, date, library
+            )
+            return [TextContent(type="text", text=result)]
+
+        case "get_seat_map":
+            sid = arguments["session_id"]
+            date = arguments["date"]
+            area_id = arguments["area_id"]
+            bt = arguments.get("begin_time", "08:12")
+            try:
+                h, m = map(int, bt.split(":"))
+                bm = h * 60 + m
+            except Exception:
+                bm = 492
+            result = await asyncio.to_thread(
+                _do_get_seat_map, sid, date, area_id, bm
+            )
+            return [TextContent(type="text", text=result)]
+
+        case "reserve_seat":
+            sid = arguments["session_id"]
+            date = arguments["date"]
+            area_id = arguments["area_id"]
+            seat_label = arguments["seat_label"]
+            begin_time = arguments["begin_time"]
+            end_time = arguments["end_time"]
+            try:
+                bh, bm = map(int, begin_time.split(":"))
+                eh, em = map(int, end_time.split(":"))
+            except Exception:
+                return [TextContent(type="text", text="❌ 时间格式错误")]
+            result = await asyncio.to_thread(
+                _do_reserve, sid, date, area_id, seat_label,
+                bh * 60 + bm, eh * 60 + em
+            )
+            return [TextContent(type="text", text=result)]
+
+        case "get_current_usage":
+            result = await asyncio.to_thread(
+                _do_current_usage, arguments["session_id"]
+            )
+            return [TextContent(type="text", text=result)]
+
+        case "get_reservations":
+            result = await asyncio.to_thread(
+                _do_reservations, arguments["session_id"]
+            )
+            return [TextContent(type="text", text=result)]
+
+        case "cancel_reservation":
+            result = await asyncio.to_thread(
+                _do_cancel, arguments["session_id"], arguments["reservation_id"]
+            )
+            return [TextContent(type="text", text=result)]
+
+        case "stop_usage":
+            result = await asyncio.to_thread(
+                _do_stop, arguments["session_id"]
+            )
+            return [TextContent(type="text", text=result)]
+
+        case "query_schedule":
+            sid = arguments["session_id"]
+            year = arguments.get("year", "2025")
+            semester = arguments.get("semester", "3")
+            result = await asyncio.to_thread(
+                _do_query_schedule, sid, year, semester
+            )
+            return [TextContent(type="text", text=result)]
+
+        case "query_exam_schedule":
+            sid = arguments["session_id"]
+            year = arguments.get("year", "2025")
+            semester = arguments.get("semester", "1")
+            result = await asyncio.to_thread(
+                _do_query_exam, sid, year, semester
+            )
+            return [TextContent(type="text", text=result)]
+
+        case "query_grades":
+            sid = arguments["session_id"]
+            year = arguments.get("year", "2025")
+            semester = arguments.get("semester", "2")
+            result = await asyncio.to_thread(
+                _do_query_grades, sid, year, semester
+            )
+            return [TextContent(type="text", text=result)]
+
+        case "get_weather":
+            result = await asyncio.to_thread(_do_weather)
+            return [TextContent(type="text", text=result)]
+
+        case _:
+            return [TextContent(type="text", text=f"未知工具: {name}")]
+
+
+# ══════════════════════════════════════════════════════════════
+# SSE + HTTP 服务器
+# ══════════════════════════════════════════════════════════════
+
+sse = SseServerTransport("/messages")
+
+
+async def handle_sse(scope, receive, send):
+    """SSE 长连接端点。"""
+    async with sse.connect_sse(scope, receive, send) as (read, write):
+        await server.run(read, write, server.create_initialization_options())
+
+
+async def async_app(scope, receive, send):
+    """原生 ASGI 应用，按路径路由。"""
+    if scope["type"] == "lifespan":
+        while True:
+            message = await receive()
+            if message["type"] == "lifespan.startup":
+                await send({"type": "lifespan.startup.complete"})
+            elif message["type"] == "lifespan.shutdown":
+                await send({"type": "lifespan.shutdown.complete"})
+                return
+
+    path = scope["path"]
+    if path == "/sse" and scope["type"] == "http":
+        await handle_sse(scope, receive, send)
+    elif path == "/messages" and scope["method"] == "POST":
+        await sse.handle_post_message(scope, receive, send)
+    elif path == "/health":
+        await send({
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [(b"content-type", b"application/json")],
+        })
+        await send({
+            "type": "http.response.body",
+            "body": b'{"status":"ok"}',
+        })
+    else:
+        await send({
+            "type": "http.response.start",
+            "status": 404,
+            "headers": [(b"content-type", b"text/plain")],
+        })
+        await send({
+            "type": "http.response.body",
+            "body": b"Not Found",
+        })
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="WHU Library MCP Server")
+    parser.add_argument("--host", default="0.0.0.0", help="监听地址")
+    parser.add_argument("--port", type=int, default=8000, help="监听端口")
+    args = parser.parse_args()
+
+    print(f"""
+==========================================================
+       WHU Library MCP Server (HTTP)
+
+  SSE endpoint: http://{args.host}:{args.port}/sse
+  Message endpoint: http://{args.host}:{args.port}/messages
+  Health check: http://{args.host}:{args.port}/health
+  Redis: {REDIS_URL}
+
+  Claude Code config (.mcp.json):
+  {{
+    "mcpServers": {{
+      "whu-lib": {{
+        "type": "sse",
+        "url": "http://<host>:{args.port}/sse"
+      }}
+    }}
+  }}
+==========================================================
+    """)
+
+    uvicorn.run(async_app, host=args.host, port=args.port)
