@@ -353,14 +353,34 @@ _qr_client = None
 
 
 def _do_get_qr() -> str:
-    """同步：获取 CAS QR 码，返回 base64 PNG。"""
+    """同步：获取 CAS QR → 解码 → ASCII 终端二维码。"""
     global _qr_client
+    import base64 as _b64, io as _io
+
+    import numpy as _np
+
     from cas_login import CasClient
     _qr_client = CasClient()
     qr_b64 = _qr_client.qr_get_image()
     if not qr_b64:
         raise RuntimeError("获取 CAS QR 码失败，请重试。")
-    return qr_b64
+
+    # 用 OpenCV 解码 CAS QR 中的 URL
+    nparr = _np.frombuffer(_b64.b64decode(qr_b64), _np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
+    detector = cv2.QRCodeDetector()
+    data, _, _ = detector.detectAndDecode(img)
+    if not data:
+        raise RuntimeError("QR 解码失败，请重试。")
+
+    # 用相同数据生成 ASCII 终端二维码
+    import qrcode as _qr
+    qr = _qr.QRCode(border=2)
+    qr.add_data(data)
+    qr.make()
+    buf = _io.StringIO()
+    qr.print_ascii(out=buf)
+    return buf.getvalue()
 
 
 def _do_poll_qr(session_id: str) -> tuple[str, str, str, str]:
@@ -617,15 +637,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent | ImageConte
     match name:
         case "login_qr":
             try:
-                qr_b64 = await asyncio.to_thread(_do_get_qr)
-                return [
-                    ImageContent(type="image", data=qr_b64, mimeType="image/png"),
-                    TextContent(
-                        type="text",
-                        text=("📱 请用**智慧珞珈 APP** 扫描上方二维码\n"
-                              "扫码完成后，调用 `login_qr_poll` 完成登录。")
-                    ),
-                ]
+                qr_text = await asyncio.to_thread(_do_get_qr)
+                return [TextContent(
+                    type="text",
+                    text=(f"{qr_text}\n"
+                          f"📱 请用**智慧珞珈 APP** 扫描上方二维码\n"
+                          f"扫码完成后，调用 `login_qr_poll` 完成登录。")
+                )]
             except Exception as e:
                 return [TextContent(type="text", text=f"❌ 获取 QR 码失败: {e}")]
 

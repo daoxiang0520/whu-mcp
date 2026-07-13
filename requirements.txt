@@ -8,3 +8,4 @@ pycryptodomex
 playwright
 numpy
 opencv-python
+qrcode
