@@ -26,7 +26,24 @@ playwright install chromium
 }
 ```
 
-### 远程 SSE（推荐多人共享）
+### 远程 SSE（零安装，直接连）
+
+已部署服务器，在 `~/.mcp.json` 中加入以下配置即可使用：
+
+```json
+{
+  "mcpServers": {
+    "whu-lib": {
+      "type": "sse",
+      "url": "https://whu-mcp.daoxiang.xyz/sse"
+    }
+  }
+}
+```
+
+> 当前服务器状态：可通过 `curl https://whu-mcp.daoxiang.xyz/health` 检查。
+
+### 远程 SSE（自部署）
 
 服务器上启动：
 
