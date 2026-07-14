@@ -133,7 +133,7 @@ def _do_login(sid: str, pwd: str) -> tuple:
 
 
 def _do_get_session(session_id: str) -> tuple:
-    """同步：从 Redis 取凭证 → 创建 LibrarySession → 返回 (session, error)"""
+    """同步：取凭证 → 创建 LibrarySession。"""
     creds = _get_store().get(session_id)
     if not creds:
         return None, "❌ session 无效或已过期，请重新登录。"
@@ -148,22 +148,73 @@ def _do_get_session(session_id: str) -> tuple:
         return None, f"❌ 创建 LibrarySession 失败: {e}"
 
 
+def _refresh_creds(session_id: str) -> bool:
+    """token 过期时用 CASTGC 重新 harvest，返回是否成功。"""
+    store = _get_store()
+    creds = store.get(session_id)
+    if not creds or not creds.get("castgc"):
+        return False
+    try:
+        from login_helper import harvest_from_castgc
+        harvest = harvest_from_castgc(creds["castgc"])
+        store.save(
+            castgc=creds["castgc"],
+            token=harvest["library_token"],
+            hmac_key=harvest["library_hmac_key"],
+            student_id=creds.get("student_id", ""),
+            educational=harvest.get("educational", creds.get("educational", "")),
+        )
+        return True
+    except Exception:
+        return False
+
+
 def _do_get_seats(session_id: str, date: str, library: str) -> str:
+    return _call_library(session_id, lambda s: s.get_seats(date, library))
+
+
+def _call_library(session_id: str, fn, ok_msg: str = "") -> str:
+    """通用 wrapper：调图书馆 API，token 过期自动刷新后重试。"""
     sess_creds, err = _do_get_session(session_id)
     if err:
         return err
-    sess, _creds = sess_creds
-    result = sess.get_seats(date, library)
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    sess, creds = sess_creds
+
+    def _try():
+        try:
+            result = fn(sess)
+            if isinstance(result, str):
+                return result, True
+            if isinstance(result, dict):
+                msg = str(result.get("message", ""))
+                if not result.get("status") and any(
+                    kw in msg for kw in ["过期", "token", "Token", "鉴权", "失效", "登录"]
+                ):
+                    return msg, False
+                if result.get("status") and ok_msg:
+                    return ok_msg, True
+                return json.dumps(result, ensure_ascii=False, indent=2), True
+            return str(result), True
+        except Exception as e:
+            return str(e), False
+
+    text, ok = _try()
+    if ok:
+        return text
+
+    # token 过期 → CASTGC 刷新 → 重试
+    if _refresh_creds(session_id):
+        sess_creds2, err2 = _do_get_session(session_id)
+        if not err2:
+            text2, _ = _try()
+            return text2
+
+    return f"❌ 请求失败（凭证已过期，请重新登录）: {text}"
 
 
 def _do_get_seat_map(session_id: str, date: str, area_id: str, begin_minute: int) -> str:
-    sess_creds, err = _do_get_session(session_id)
-    if err:
-        return err
-    sess, _creds = sess_creds
-    result = sess.get_seat_map(date, area_id, begin_minute)
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    return _call_library(session_id,
+        lambda s: s.get_seat_map(date, area_id, begin_minute))
 
 
 def _do_reserve(session_id: str, date: str, area_id: str,
@@ -173,71 +224,54 @@ def _do_reserve(session_id: str, date: str, area_id: str,
         return err
     sess, creds = sess_creds
 
-    # 1. 获取座位 UUID
-    seat_map = sess.get_seat_map(date, area_id)
-    seat_uuid = ""
-    for uid, info in seat_map.get("data", {}).items():
-        if info.get("label") == seat_label:
-            seat_uuid = uid
-            break
-    if not seat_uuid:
-        return f"❌ 未找到 {seat_label} 号座位。"
+    def _try_reserve():
+        seat_map = sess.get_seat_map(date, area_id)
+        seat_uuid = ""
+        for uid, info in seat_map.get("data", {}).items():
+            if info.get("label") == seat_label:
+                seat_uuid = uid
+                break
+        if not seat_uuid:
+            return f"❌ 未找到 {seat_label} 号座位。"
+        path = f"/jsq/static/frontApi/make/freeBook/{seat_uuid}/{date}/{begin_minute}/{end_minute}"
+        result = sess._post(path, {})
+        msg = result.get("message", "")
+        if not result.get("status") and ("验证" in msg or "滑块" in msg or "captcha" in msg.lower()):
+            from captcha_solver import solve_captcha
+            cap_result = solve_captcha(username=creds.get("student_id", ""))
+            if cap_result.get("success"):
+                cap_token = cap_result.get("data", {}).get("token", "")
+                result = sess._post(f"{path}?capToken={cap_token}", {})
+        if result.get("status"):
+            return f"✅ 预约成功！{date} {seat_label}号"
+        return f"❌ 预约失败: {result.get('message', '未知错误')}"
 
-    # 2. 提交预约
-    path = f"/jsq/static/frontApi/make/freeBook/{seat_uuid}/{date}/{begin_minute}/{end_minute}"
-    result = sess._post(path, {})
-    msg = result.get("message", "")
-
-    # 3. 触发验证码 → 自动破解 → 带 token 重试
-    if not result.get("status") and ("验证" in msg or "滑块" in msg or "captcha" in msg.lower()):
-        from captcha_solver import solve_captcha
-        username = creds.get("student_id", "")
-        cap_result = solve_captcha(username=username)
-        if cap_result.get("success"):
-            cap_token = cap_result.get("data", {}).get("token", "")
-            result = sess._post(f"{path}?capToken={cap_token}", {})
-
-    if result.get("status"):
-        return f"✅ 预约成功！{date} {seat_label}号"
-    return f"❌ 预约失败: {result.get('message', '未知错误')}"
+    text = _try_reserve()
+    if text.startswith("✅"):
+        return text
+    if _refresh_creds(session_id):
+        sess2, _ = _do_get_session(session_id)
+        sess = sess2
+        return _try_reserve()
+    return text
 
 
 def _do_current_usage(session_id: str) -> str:
-    sess_creds, err = _do_get_session(session_id)
-    if err:
-        return err
-    sess, _creds = sess_creds
-    return json.dumps(sess.get_current_usage(), ensure_ascii=False, indent=2)
+    return _call_library(session_id, lambda s: s.get_current_usage())
 
 
 def _do_reservations(session_id: str) -> str:
-    sess_creds, err = _do_get_session(session_id)
-    if err:
-        return err
-    sess, _creds = sess_creds
-    return json.dumps(sess.get_reservations(), ensure_ascii=False, indent=2)
+    return _call_library(session_id, lambda s: s.get_reservations())
 
 
 def _do_cancel(session_id: str, reservation_id: str) -> str:
-    sess_creds, err = _do_get_session(session_id)
-    if err:
-        return err
-    sess, _creds = sess_creds
-    result = sess.cancel(reservation_id)
-    if result.get("status"):
-        return "✅ 取消成功！"
-    return f"❌ 取消失败: {result.get('message', '未知错误')}"
+    return _call_library(session_id, lambda s: s.cancel(reservation_id),
+                         ok_msg="✅ 取消成功！")
 
 
 def _do_stop(session_id: str) -> str:
-    sess_creds, err = _do_get_session(session_id)
-    if err:
-        return err
-    sess, _creds = sess_creds
-    result = sess.stop()
-    if result.get("status"):
-        return "✅ 签退成功，座位已释放！"
-    return f"❌ 签退失败: {result.get('message', '未知错误')}"
+    return _call_library(session_id, lambda s: s.stop(),
+                         ok_msg="✅ 签退成功，座位已释放！")
 
 
 def _get_educational(session_id: str) -> tuple[str | None, str | None]:
