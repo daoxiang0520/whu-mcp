@@ -43,10 +43,33 @@ from mcp.server import Server
 from mcp.server.sse import SseServerTransport
 from mcp.types import Tool, TextContent
 
-from redis_store import CredStore
-
 # ── 配置 ────────────────────────────────────────────────────
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+
+class MemStore:
+    """内存凭证存储 — 零外部依赖。重启丢失，SSE 模式使用。"""
+    def __init__(self):
+        self._data: dict = {}
+
+    def save(self, castgc: str, token: str, hmac_key: str,
+             student_id: str = "", educational: str = "", **kw) -> str:
+        import uuid as _uuid
+        sid = str(_uuid.uuid4())[:12]
+        self._data[sid] = {
+            "castgc": castgc, "library_token": token,
+            "library_hmac_key": hmac_key, "student_id": student_id,
+            "educational": educational,
+        }
+        return sid
+
+    def get(self, session_id: str) -> dict | None:
+        return self._data.get(session_id)
+
+    def delete(self, session_id: str) -> bool:
+        return self._data.pop(session_id, None) is not None
+
+    def exists(self, session_id: str) -> bool:
+        return session_id in self._data
+
 
 class FileStore:
     """本地文件凭证存储 (stdio 模式使用，零外部依赖)。"""
@@ -855,7 +878,7 @@ if __name__ == "__main__":
 
     else:
         # === SSE 模式：Redis 凭证 + HTTP 服务器 ===
-        cred_store = CredStore(redis_url=REDIS_URL)
+        cred_store = MemStore()
         print(f"""
 ==========================================================
        WHU Library MCP Server (SSE)
@@ -863,7 +886,6 @@ if __name__ == "__main__":
   SSE endpoint: http://{args.host}:{args.port}/sse
   Message endpoint: http://{args.host}:{args.port}/messages
   Health check: http://{args.host}:{args.port}/health
-  Redis: {REDIS_URL}
 
   Claude Code config (.mcp.json):
   {{
