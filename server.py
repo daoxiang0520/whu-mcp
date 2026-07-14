@@ -355,7 +355,7 @@ _qr_client = None
 def _do_get_qr() -> tuple[str, str]:
     """同步：获取 CAS QR → 存 PNG + 生成 ASCII → 返回 (文件路径, ASCII文本)"""
     global _qr_client
-    import base64 as _b64, io as _io
+    import base64 as _b64, io as _io, tempfile
 
     from cas_login import CasClient
     _qr_client = CasClient()
