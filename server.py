@@ -352,53 +352,67 @@ def _do_query_grades(session_id: str, year: str, semester: str) -> str:
 _qr_client = None
 
 
-def _do_get_qr() -> str:
-    """同步：获取 CAS QR → 解码 → ASCII 终端二维码。"""
+def _do_get_qr() -> tuple[str, str]:
+    """同步：获取 CAS QR → 存 PNG + 生成 ASCII → 返回 (文件路径, ASCII文本)"""
     global _qr_client
     import base64 as _b64, io as _io
-
-    import cv2, numpy as _np
 
     from cas_login import CasClient
     _qr_client = CasClient()
     qr_b64 = _qr_client.qr_get_image()
     if not qr_b64:
         raise RuntimeError("获取 CAS QR 码失败，请重试。")
+    qr_bytes = _b64.b64decode(qr_b64)
 
-    # 用 OpenCV 解码 CAS QR 中的 URL
-    nparr = _np.frombuffer(_b64.b64decode(qr_b64), _np.uint8)
+    # 保存 PNG 到临时目录
+    qr_path = os.path.join(tempfile.gettempdir(), "whu-cas-qr.png")
+    with open(qr_path, "wb") as f:
+        f.write(qr_bytes)
+
+    # 用 OpenCV 解码 → 生成 ASCII 终端二维码
+    import cv2, numpy as _np, qrcode as _qr
+    nparr = _np.frombuffer(qr_bytes, _np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
-    detector = cv2.QRCodeDetector()
-    data, _, _ = detector.detectAndDecode(img)
-    if not data:
-        raise RuntimeError("QR 解码失败，请重试。")
+    data, _, _ = cv2.QRCodeDetector().detectAndDecode(img)
+    ascii_qr = ""
+    if data:
+        qr = _qr.QRCode(border=1, box_size=1)
+        qr.add_data(data)
+        qr.make()
+        buf = _io.StringIO()
+        qr.print_ascii(out=buf, invert=True)
+        ascii_qr = buf.getvalue()
 
-    # 用相同数据生成紧凑 ASCII 终端二维码
-    import qrcode as _qr
-    qr = _qr.QRCode(border=1, box_size=1)
-    qr.add_data(data)
-    qr.make()
-    buf = _io.StringIO()
-    qr.print_ascii(out=buf, invert=True)
-    return "\n" + buf.getvalue()
+    return qr_path, ascii_qr
 
 
-def _do_poll_qr(session_id: str) -> tuple[str, str, str, str]:
+def _do_poll_qr() -> tuple[str, str, str, str]:
     """同步：轮询 QR 扫码结果 → harvest → 返回 (castgc, token, hmac_key, educational)"""
     global _qr_client
     from login_helper import harvest_from_castgc
+
     if _qr_client is None:
-        from cas_login import CasClient
-        _qr_client = CasClient()
-        _qr_client.qr_get_image()  # 获取新 QR
+        raise RuntimeError("没有活跃的 QR 码，请先调用 login_qr。")
+
     castgc = _qr_client.qr_poll(timeout=120)
     if not castgc:
+        _qr_client = None
         raise TimeoutError("QR 码扫码超时 (120s)，请重新调用 login_qr 重试。")
-    qr_client = _qr_client
-    _qr_client = None
+
     harvest = harvest_from_castgc(castgc)
+    _qr_client = None
+
+    # 登录成功后清理 QR 文件
+    qr_path = os.path.join(tempfile.gettempdir(), "whu-cas-qr.png")
+    try:
+        os.remove(qr_path)
+    except Exception:
+        pass
+
     return (castgc, harvest["library_token"], harvest["library_hmac_key"],
             harvest.get("educational", ""))
+
+
 
 
 def _do_weather() -> str:
@@ -637,32 +651,27 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent | ImageConte
     match name:
         case "login_qr":
             try:
-                qr_text = await asyncio.to_thread(_do_get_qr)
-                return [TextContent(
-                    type="text",
-                    text=(
-                        f"{qr_text}\n"
-                        f"📱 用智慧珞珈 APP 扫码，完成后告诉我"
-                    )
-                )]
+                qr_path, ascii_qr = await asyncio.to_thread(_do_get_qr)
+                parts = [f"📁 QR 图片: {qr_path}\n双击打开或用手机扫码。"]
+                if ascii_qr:
+                    parts.append(f"\n{ascii_qr}")
+                parts.append("\n📱 用智慧珞珈 APP 扫码，完成后调用 login_qr_poll 登录。")
+                return [TextContent(type="text", text="".join(parts))]
             except Exception as e:
                 return [TextContent(type="text", text=f"❌ 获取 QR 码失败: {e}")]
 
         case "login_qr_poll":
             try:
                 castgc, token, hmac_key, educational = await asyncio.to_thread(
-                    _do_poll_qr, ""
+                    _do_poll_qr
                 )
                 session_id = _get_store().save(
                     castgc=castgc, token=token, hmac_key=hmac_key,
                     educational=educational,
                 )
-                return [TextContent(
-                    type="text",
-                    text=(f"✅ 扫码登录成功！\n"
-                          f"session_id: `{session_id}`\n"
-                          f"有效期: 约 4 小时")
-                )]
+                return [TextContent(type="text",
+                    text=f"✅ 扫码登录成功！session_id: `{session_id}` (有效期约 4 小时)")
+                ]
             except TimeoutError as e:
                 return [TextContent(type="text", text=f"⏰ {e}")]
             except Exception as e:
