@@ -41,7 +41,7 @@ import uvicorn
 
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
-from mcp.types import Tool, TextContent, ImageContent
+from mcp.types import Tool, TextContent
 
 from redis_store import CredStore
 
@@ -352,38 +352,31 @@ def _do_query_grades(session_id: str, year: str, semester: str) -> str:
 _qr_client = None
 
 
-def _do_get_qr() -> tuple[str, str]:
-    """同步：获取 CAS QR → 存 PNG + 生成 ASCII → 返回 (文件路径, ASCII文本)"""
+def _do_get_qr() -> str:
+    """同步：获取 CAS QR → OpenCV 解码 → qrcode 生成 ASCII 终端二维码。"""
     global _qr_client
-    import base64 as _b64, io as _io, tempfile
+    import base64 as _b64, io as _io
+    import cv2, numpy as _np, qrcode as _qr
 
     from cas_login import CasClient
     _qr_client = CasClient()
     qr_b64 = _qr_client.qr_get_image()
     if not qr_b64:
         raise RuntimeError("获取 CAS QR 码失败，请重试。")
+
     qr_bytes = _b64.b64decode(qr_b64)
-
-    # 保存 PNG 到临时目录
-    qr_path = os.path.join(tempfile.gettempdir(), "whu-cas-qr.png")
-    with open(qr_path, "wb") as f:
-        f.write(qr_bytes)
-
-    # 用 OpenCV 解码 → 生成 ASCII 终端二维码
-    import cv2, numpy as _np, qrcode as _qr
     nparr = _np.frombuffer(qr_bytes, _np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
     data, _, _ = cv2.QRCodeDetector().detectAndDecode(img)
-    ascii_qr = ""
-    if data:
-        qr = _qr.QRCode(border=1, box_size=1)
-        qr.add_data(data)
-        qr.make()
-        buf = _io.StringIO()
-        qr.print_ascii(out=buf, invert=True)
-        ascii_qr = buf.getvalue()
+    if not data:
+        raise RuntimeError("QR 解码失败，请重试。")
 
-    return qr_path, ascii_qr
+    qr = _qr.QRCode(border=1, box_size=1)
+    qr.add_data(data)
+    qr.make()
+    buf = _io.StringIO()
+    qr.print_ascii(out=buf, invert=True)
+    return "\n" + buf.getvalue()
 
 
 def _do_poll_qr() -> tuple[str, str, str, str]:
@@ -401,14 +394,6 @@ def _do_poll_qr() -> tuple[str, str, str, str]:
 
     harvest = harvest_from_castgc(castgc)
     _qr_client = None
-
-    # 登录成功后清理 QR 文件
-    qr_path = os.path.join(tempfile.gettempdir(), "whu-cas-qr.png")
-    try:
-        os.remove(qr_path)
-    except Exception:
-        pass
-
     return (castgc, harvest["library_token"], harvest["library_hmac_key"],
             harvest.get("educational", ""))
 
@@ -647,16 +632,14 @@ def _get_username_from_session(creds: dict) -> str:
 # ══════════════════════════════════════════════════════════════
 
 @server.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[TextContent | ImageContent]:
+async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     match name:
         case "login_qr":
             try:
-                qr_path, ascii_qr = await asyncio.to_thread(_do_get_qr)
-                parts = [f"📁 QR 图片: {qr_path}\n双击打开或用手机扫码。"]
-                if ascii_qr:
-                    parts.append(f"\n{ascii_qr}")
-                parts.append("\n📱 用智慧珞珈 APP 扫码，完成后调用 login_qr_poll 登录。")
-                return [TextContent(type="text", text="".join(parts))]
+                qr_text = await asyncio.to_thread(_do_get_qr)
+                return [TextContent(type="text",
+                    text=f"{qr_text}\n（如未显示完整二维码，请按 Ctrl+O 展开）\n📱 用智慧珞珈 APP 扫码，完成后调用 login_qr_poll 登录。"
+                )]
             except Exception as e:
                 return [TextContent(type="text", text=f"❌ 获取 QR 码失败: {e}")]
 
